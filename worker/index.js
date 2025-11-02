@@ -1,16 +1,13 @@
 // worker.js
-// Telegram CC Gen Worker (masked card numbers) + CVV column (masked as XXX)
+// Telegram CC Gen Worker (masked card numbers + RANDOM CVV placeholders)
 // Env required: TELEGRAM_TOKEN_ENV
-// Commands:
-//   /gen <template> or /gen <template>|MM|YY  -> generates 10 masked rows with Expiry + CVV (masked)
-//   /gen1 <template>|MM|YY                    -> single masked line with CVV (masked)
 
 function escapeHtml(s) {
   if (!s) return "";
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Masked template: replace x/X with literal 'X' to prevent producing usable numbers
+// Masked template: replace x/X with literal 'X' (keeps digits intact)
 function fillTemplateMasked(template) {
   if (!template) return "";
   let out = "";
@@ -42,8 +39,12 @@ function normalizeExpiry(m, y) {
   return { month, year };
 }
 
+// Random 3-digit CVV generator (100..999)
+function genRandomCVV() {
+  return String(Math.floor(Math.random() * 900) + 100);
+}
+
 // Telegram send (HTML)
-// Note: TELEGRAM_TOKEN_ENV must be set in Worker env
 async function sendTelegramMessage(token, chatId, htmlText) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const body = { chat_id: chatId, text: htmlText, parse_mode: "HTML", disable_web_page_preview: true };
@@ -79,7 +80,7 @@ export default {
     const TELEGRAM_TOKEN = env.TELEGRAM_TOKEN_ENV;
     if (!TELEGRAM_TOKEN) return new Response("Error: TELEGRAM_TOKEN_ENV not set.", { status: 500 });
 
-    if (request.method === "GET") return new Response("OK - CC Gen Worker (masked + CVV placeholder)", { status: 200 });
+    if (request.method === "GET") return new Response("OK - CC Gen Worker (masked + random CVV)", { status: 200 });
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
 
     let update;
@@ -102,21 +103,22 @@ export default {
     // /start or /help
     if (text.startsWith("/start") || text.startsWith("/help")) {
       const help = [
-        "👋 CC Gen Bot — MASKED OUTPUT (CVV shown as placeholder)",
+        "👋 CC Gen Bot — MASKED + RANDOM CVV PLACEHOLDERS",
         "",
         "Commands:",
-        "/gen <template> or /gen <template>|MM|YY  — generate 10 masked rows with Expiry + CVV (CVV = XXX)",
-        "/gen1 <template>|MM|YY                    — generate 1 masked line with CVV (CVV = XXX)",
+        "/gen <template> or /gen <template>|MM|YY  — generate 10 masked rows with Expiry + random CVV (100-999)",
+        "/gen1 <template>|MM|YY                    — generate 1 masked line with random CVV",
         "",
-        "Example: /gen 515462001764xxxx|03|31",
+        "Template example: 515462001764xxxx  (use x/X as placeholders)",
+        "Expiry example: |03|31  (MM|YY) or |03|2031 (MM|YYYY)",
         "",
-        "Note: This bot WILL NOT produce usable card numbers or real CVVs. CVV is shown as masked placeholder 'XXX'."
+        "Note: This bot WILL NOT produce usable card numbers. CVV values shown are random placeholders and NOT real CVVs."
       ].join("\n");
       await replyHtml(`<pre>${escapeHtml(help)}</pre>`);
       return new Response("OK", { status: 200 });
     }
 
-    // /gen1 -> single masked line with CVV placeholder
+    // /gen1 -> single masked line with random CVV
     if (text.startsWith("/gen1")) {
       const parts = text.split(/\s+/);
       const arg = parts.slice(1).join(" ").trim();
@@ -133,13 +135,13 @@ export default {
 
       const masked = fillTemplateMasked(templateRaw);
       const { month, year } = normalizeExpiry(m, y);
-      const cvvMasked = "XXX"; // placeholder for CVV
-      const line = `${masked} | ${month}/${year} | ${cvvMasked}`;
+      const cvv = genRandomCVV();
+      const line = `${masked} | ${month}/${year} | ${cvv}`;
       await replyHtml(`<pre>${escapeHtml(line)}</pre>`);
       return new Response("OK", { status: 200 });
     }
 
-    // /gen -> 10 masked rows with CVV placeholder
+    // /gen -> 10 masked rows with random CVV
     if (text.startsWith("/gen")) {
       const parts = text.split(/\s+/);
       const arg = parts.slice(1).join(" ").trim();
@@ -159,7 +161,7 @@ export default {
       const rows = [];
       for (let i = 0; i < 10; i++) {
         const masked = fillTemplateMasked(templateRaw);
-        rows.push({ num: masked, expiry: `${month}/${year}`, cvv: "XXX" });
+        rows.push({ num: masked, expiry: `${month}/${year}`, cvv: genRandomCVV() });
       }
 
       // Build monospaced table with three columns: Card Number | Expiry | CVV
