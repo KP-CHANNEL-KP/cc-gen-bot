@@ -1,0 +1,5 @@
+name = "cc-gen-telegram-bot"
+type = "javascript"  # or "webpack"/"modules" if using modules
+account_id = "YOUR_CF_ACCOUNT_ID"
+workers_dev = true   # or false if using custom domain
+compatibility_date = "2025-11-02"
