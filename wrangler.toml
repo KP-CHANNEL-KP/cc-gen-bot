@@ -1,5 +1,5 @@
 name = "cc-gen-telegram-bot"
 type = "javascript"
-account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+account_id = "6e2b82b9e75be7971ad52d7963e2272c"
 workers_dev = true
 compatibility_date = "2025-11-02"
