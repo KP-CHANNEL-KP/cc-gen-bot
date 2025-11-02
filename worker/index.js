@@ -1,96 +1,52 @@
-// worker.js (updated)
-// - better table spacing
-// - getBinInfo returns diagnostics on failure so output shows why BIN was Unknown
-// - masked output (no real card numbers)
+// worker.js
+// Telegram CC Gen Worker (expanded, safe-mode, deploy-ready)
+// Env required: TELEGRAM_TOKEN_ENV
+// Env optional: WEBHOOK_SECRET (if set, requests must include header "x-webhook-secret": "<value>")
+// Commands:
+//   /start, /help
+//   /gen <template> or /gen <template>|MM|YY (or YYYY)   -> generate 10 masked cards (each line)
+//   /gen1 <template>|MM|YY                              -> single masked line
+//
+// Notes:
+// - This worker DOES NOT output unmasked live card numbers for safety.
+// - Template may include digits and x/X placeholders. Example: 515462001764xxxx
+// - If template does not contain 6 numeric digits at start, BIN lookup disabled (we removed BIN lookup per request).
+// - Works as Telegram webhook receiver: configure your bot webhook to this worker URL.
 
 function escapeHtml(s) {
   if (!s) return "";
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function countryCodeToEmoji(code) {
-  if (!code) return "";
-  const A = 0x1F1E6;
-  return String.fromCodePoint(...code.toUpperCase().split("").map(c => A + c.charCodeAt(0) - 65));
-}
-
-// --------------------------
-// getBinInfo with diagnostics
-// returns { info: {...} | null, error: null | "HTTP 429" | "NETWORK" | "NOT_FOUND" | message }
-// --------------------------
-async function getBinInfo(bin6) {
-  bin6 = String(bin6 || "").replace(/\D/g, "").slice(0, 6);
-  if (bin6.length < 6) return { info: null, error: "INVALID_BIN" };
-
-  const cache = caches.default;
-  const cacheKey = new Request(`https://workers.internal/binlist/${bin6}`);
-
-  try {
-    // Try cache
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      try {
-        const cachedJson = await cached.json();
-        return { info: cachedJson, error: null };
-      } catch (e) { /* fallthrough */ }
-    }
-
-    // Fetch binlist
-    const resp = await fetch(`https://lookup.binlist.net/${bin6}`, {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        "User-Agent": "CF-Telegram-CCGen/1.0 (+https://example.com)"
-      }
-    });
-
-    if (!resp.ok) {
-      // return HTTP status as error
-      return { info: null, error: `HTTP_${resp.status}` };
-    }
-
-    const j = await resp.json();
-
-    const info = {
-      scheme: (j.scheme || j.brand || "unknown").toLowerCase(),
-      type: (j.type || "unknown").toLowerCase(),
-      bank: (j.bank && (j.bank.name || j.bank)) || "Unknown Bank",
-      country: (j.country && (j.country.name || j.country)) || "Unknown",
-      country_alpha2: (j.country && j.country.alpha2) || null,
-      country_emoji: (j.country && j.country.alpha2) ? countryCodeToEmoji(j.country.alpha2) : ""
-    };
-
-    // Cache normalized info for 24h
-    const respToCache = new Response(JSON.stringify(info), {
-      status: 200,
-      headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=86400" }
-    });
-    await cache.put(cacheKey, respToCache.clone());
-
-    return { info, error: null };
-  } catch (e) {
-    // network or unknown error
-    return { info: null, error: "NETWORK_ERROR" };
-  }
-}
-
-// --------------------------
-// Safe mask helpers
-// --------------------------
-function fillTemplateMasked(template) {
+// replace 'x'/'X' in template with random digits (safe: still masked if template contains X letters)
+function fillTemplateRandom(template) {
   if (!template) return "";
   let out = "";
-  for (let c of String(template)) {
-    if (c === "x" || c === "X") out += "X";
-    else out += c;
+  for (const ch of String(template)) {
+    if (ch === "x" || ch === "X") {
+      out += String(Math.floor(Math.random() * 10));
+    } else {
+      out += ch;
+    }
   }
   return out;
 }
 
-function normalizeExpiry(monthIn, yearIn) {
-  let month = monthIn;
-  let year = yearIn;
+// If you prefer to keep 'X' literal mask rather than real digits, use this:
+function fillTemplateMasked(template) {
+  if (!template) return "";
+  let out = "";
+  for (const ch of String(template)) {
+    if (ch === "x" || ch === "X") out += "X";
+    else out += ch;
+  }
+  return out;
+}
 
+// Normalize expiry input (m may be "3" or "03", y may be "31" or "2031")
+function normalizeExpiry(m, y) {
+  let month = m;
+  let year = y;
   if (!month || !/^\d{1,2}$/.test(month)) {
     month = String(Math.floor(Math.random() * 12) + 1).padStart(2, "0");
   } else {
@@ -108,127 +64,195 @@ function normalizeExpiry(monthIn, yearIn) {
   return { month, year };
 }
 
-// Telegram helper
-async function sendMessageHTML(chatId, htmlText, TELEGRAM_TOKEN) {
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-  const body = { chat_id: chatId, text: htmlText, parse_mode: "HTML", disable_web_page_preview: true };
-  await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+// Telegram send (HTML)
+async function sendTelegramMessage(token, chatId, htmlText) {
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const body = {
+    chat_id: chatId,
+    text: htmlText,
+    parse_mode: "HTML",
+    disable_web_page_preview: true
+  };
+  await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
 }
 
-// Main worker
+// Splits a very long message into smaller chunks (Telegram has message size limits)
+function splitLongText(text, maxLen = 3500) {
+  if (text.length <= maxLen) return [text];
+  const parts = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(text.length, start + maxLen);
+    // try to break at newline
+    if (end < text.length) {
+      const nl = text.lastIndexOf("\n", end);
+      if (nl > start) end = nl + 1;
+    }
+    parts.push(text.slice(start, end));
+    start = end;
+  }
+  return parts;
+}
+
+// Validate template: must have at least one 'x' or at least one non-x digit and length >= 12 (best-effort)
+function isValidTemplate(t) {
+  if (!t || typeof t !== "string") return false;
+  const cleaned = t.replace(/[^0-9xX]/g, "");
+  if (cleaned.length < 12) return false; // heuristic minimal length
+  // allow templates that include digits and/or x
+  return /[0-9xX]/.test(cleaned);
+}
+
+// Optional webhook secret guard
+function checkWebhookSecret(request, expected) {
+  if (!expected) return true; // not required
+  const header = request.headers.get("x-webhook-secret") || request.headers.get("x-webhook-token");
+  return header === expected;
+}
+
 export default {
   async fetch(request, env) {
-    const TELEGRAM_TOKEN = env.TELEGRAM_TOKEN_ENV || "";
-    if (!TELEGRAM_TOKEN) return new Response("Error: TELEGRAM_TOKEN_ENV not set.", { status: 500 });
+    const TELEGRAM_TOKEN = env.TELEGRAM_TOKEN_ENV;
+    const WEBHOOK_SECRET = env.WEBHOOK_SECRET; // optional
 
-    if (request.method !== "POST") return new Response("✅ Worker running", { status: 200 });
+    if (!TELEGRAM_TOKEN) {
+      return new Response("Error: TELEGRAM_TOKEN_ENV not set.", { status: 500 });
+    }
+
+    // Allow GET for quick health check
+    if (request.method === "GET") {
+      return new Response("OK - CC Gen Worker (safe)", { status: 200 });
+    }
+
+    // Only accept POST updates from Telegram (webhook)
+    if (request.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    // If webhook secret is configured, verify header
+    if (!checkWebhookSecret(request, WEBHOOK_SECRET)) {
+      return new Response("Forbidden (webhook secret)", { status: 403 });
+    }
 
     let update;
-    try { update = await request.json(); } catch (e) { return new Response("Bad JSON", { status: 400 }); }
+    try {
+      update = await request.json();
+    } catch (e) {
+      return new Response("Bad JSON", { status: 400 });
+    }
+
     const message = update.message || update.edited_message || (update.callback_query && update.callback_query.message);
-    if (!message || !message.text) return new Response("No message", { status: 200 });
+    if (!message || !message.text) {
+      // nothing to do
+      return new Response("No message", { status: 200 });
+    }
 
     const text = message.text.trim();
-    const chatId = message.chat.id;
+    const chatId = message.chat && (message.chat.id || (message.chat && message.chat.id));
+    if (!chatId) return new Response("No chat id", { status: 200 });
 
+    // helper to reply
+    async function replyHtml(html) {
+      const parts = splitLongText(html);
+      for (const p of parts) {
+        await sendTelegramMessage(TELEGRAM_TOKEN, chatId, p);
+      }
+    }
+
+    // /start or /help
     if (text.startsWith("/start") || text.startsWith("/help")) {
       const help = [
         "👋 CC Gen Bot — SAFE MODE",
         "",
-        "Use /gen <template>|MM|YY  e.g. /gen 515462001764xxxx|03|31",
-        "Will output 10 masked rows and BIN info (if binlist lookup works)."
+        "Commands:",
+        "/gen <template> or /gen <template>|MM|YY  — generate 10 masked rows",
+        "/gen1 <template>|MM|YY                  — generate 1 masked line",
+        "",
+        "Template example: 515462001764xxxx  (use x/X as placeholders)",
+        "Expiry example: |03|31  (MM|YY) or |03|2031 (MM|YYYY)",
+        "",
+        "Notes:",
+        "- This bot DOES NOT output unmasked live card numbers.",
+        "- For Stripe testing, use client-side tokenization and server-side token inspect."
       ].join("\n");
-      await sendMessageHTML(chatId, `<pre>${escapeHtml(help)}</pre>`, TELEGRAM_TOKEN);
+      await replyHtml(`<pre>${escapeHtml(help)}</pre>`);
       return new Response("OK", { status: 200 });
     }
 
-    if (text.startsWith("/gen")) {
+    // /gen1 -> single masked line
+    if (text.startsWith("/gen1")) {
       const parts = text.split(/\s+/);
-      const arg = parts[1] || "";
+      const arg = parts.slice(1).join(" ").trim(); // support if template contains spaces (unlikely)
       if (!arg) {
-        await sendMessageHTML(chatId, `<pre>❌ Usage: /gen <template>|MM|YY  e.g. /gen 515462001764xxxx|03|31</pre>`, TELEGRAM_TOKEN);
+        await replyHtml(`<pre>Usage: /gen1 <template>|MM|YY  e.g. /gen1 515462001764xxxx|03|31</pre>`);
         return new Response("OK", { status: 200 });
       }
 
-      let [templatePart, m, y] = arg.split("|").map(s => s.trim());
-      if (!templatePart) templatePart = arg;
-      const digitsOnly = (templatePart || "").replace(/[^0-9xX]/g, "");
-      if (digitsOnly.length < 6) {
-        await sendMessageHTML(chatId, `<pre>❌ Template invalid — include at least first 6 digits or x's. Example: 515462001764xxxx</pre>`, TELEGRAM_TOKEN);
+      const [templateRaw, m, y] = arg.split("|").map(s => s.trim());
+      if (!isValidTemplate(templateRaw)) {
+        await replyHtml(`<pre>Invalid template. Include at least 12 digits/x characters. Example: 515462001764xxxx</pre>`);
         return new Response("OK", { status: 200 });
       }
+
+      // Choose whether to output masked X placeholders or random digits for x's:
+      // Option A: masked placeholders (safe): use fillTemplateMasked
+      // Option B: random digits (still not real validated numbers): use fillTemplateRandom
+      const useMaskedPlaceholders = true; // set to false to fill with random digits instead
+
+      const cardNum = useMaskedPlaceholders ? fillTemplateMasked(templateRaw) : fillTemplateRandom(templateRaw);
+      const { month, year } = normalizeExpiry(m, y);
+      const line = `${cardNum} | ${month}/${year}`;
+      await replyHtml(`<pre>${escapeHtml(line)}</pre>`);
+      return new Response("OK", { status: 200 });
+    }
+
+    // /gen -> 10 masked rows table
+    if (text.startsWith("/gen")) {
+      const parts = text.split(/\s+/);
+      const arg = parts.slice(1).join(" ").trim();
+      if (!arg) {
+        await replyHtml(`<pre>Usage: /gen <template>|MM|YY  e.g. /gen 515462001764xxxx|03|31</pre>`);
+        return new Response("OK", { status: 200 });
+      }
+
+      let [templateRaw, m, y] = arg.split("|").map(s => s.trim());
+      if (!templateRaw) templateRaw = arg;
+      if (!isValidTemplate(templateRaw)) {
+        await replyHtml(`<pre>Invalid template. Include at least 12 digits/x characters. Example: 515462001764xxxx</pre>`);
+        return new Response("OK", { status: 200 });
+      }
+
+      // choose masked placeholders or random digits for x's
+      const useMaskedPlaceholders = true; // true => X characters; false => random digits in place of x
 
       const { month, year } = normalizeExpiry(m, y);
 
-      // build masked rows
+      // Generate 10 rows
       const rows = [];
       for (let i = 0; i < 10; i++) {
-        const masked = fillTemplateMasked(templatePart);
-        rows.push({ masked, expiry: `${month}/${year}` });
+        const val = useMaskedPlaceholders ? fillTemplateMasked(templateRaw) : fillTemplateRandom(templateRaw);
+        rows.push({ num: val, expiry: `${month}/${year}` });
       }
 
-      // build table with more spacing and blank line after table
-      const col1 = 24, col2 = 10;
+      // Build monospaced table
+      const col1 = 26; // card number column width
+      const col2 = 10;
       const header = ["Card Number".padEnd(col1), "Expiry".padEnd(col2)].join(" ");
       const sep = "-".repeat(col1 + col2 + 1);
       const lines = [header, sep];
-      for (const r of rows) {
-        lines.push(r.masked.padEnd(col1) + " " + r.expiry.padEnd(col2));
-      }
-      const tableBlock = `<pre>${escapeHtml(lines.join("\n"))}</pre>`;
+      for (const r of rows) lines.push(r.num.padEnd(col1) + " " + r.expiry.padEnd(col2));
 
-      // BIN lookup (use numeric first-6 if provided)
-      let firstSix = (templatePart.match(/[0-9]{6}/) || [null])[0] || null;
-      // if no numeric 6 in template, but template starts with digits/x, try take first 6 chars (may include X) -> skip lookup
-      if (!firstSix) {
-        const maybe = templatePart.replace(/[^0-9xX]/g, '').slice(0,6);
-        if (maybe && !/[xX]/.test(maybe)) firstSix = maybe;
-      }
-
-      let binInfoResult = null;
-      if (firstSix) {
-        binInfoResult = await getBinInfo(firstSix);
-      } else {
-        binInfoResult = { info: null, error: "NO_NUMERIC_BIN" };
-      }
-
-      let bank = "Unknown Bank", country = "Unknown", countryEmoji = "", scheme = "UNKNOWN", type = "UNKNOWN", binDisplay = firstSix || "N/A";
-      let diag = "";
-      if (binInfoResult && binInfoResult.info) {
-        const info = binInfoResult.info;
-        bank = info.bank || bank;
-        country = info.country || country;
-        countryEmoji = info.country_emoji || "";
-        scheme = (info.scheme || scheme).toUpperCase();
-        type = (info.type || type).toUpperCase();
-      } else {
-        // include diagnostic reason for why BIN info missing
-        const err = binInfoResult ? binInfoResult.error : "UNKNOWN";
-        if (err === "NO_NUMERIC_BIN") diag = "BIN lookup skipped (no numeric 6-digit found in template)";
-        else if (err === "INVALID_BIN") diag = "Invalid BIN (need 6 digits)";
-        else if (err && err.startsWith("HTTP_")) diag = `BIN lookup failed: ${err} (binlist returned HTTP status)`;
-        else if (err === "NETWORK_ERROR") diag = "BIN lookup failed: network error (possible outbound blocked)";
-        else diag = "BIN lookup not available";
-      }
-
-      // info block with diagnostic on separate pre block for clarity
-      const infoLines = [
-        `<b>Bank:</b> ${escapeHtml(bank)}`,
-        `<b>Country:</b> ${escapeHtml(country)} ${countryEmoji}`,
-        `<b>BIN Info:</b> ${escapeHtml(`${scheme} - ${type}`)}`,
-        `<b>BIN:</b> ${escapeHtml(binDisplay)}`
-      ].join("\n");
-
-      const diagLine = diag ? `\n\n<i>Note:</i> ${escapeHtml(diag)}` : "";
-
-      const finalHtml = tableBlock + "\n" + `<pre>${infoLines}</pre>` + diagLine;
-
-      await sendMessageHTML(chatId, finalHtml, TELEGRAM_TOKEN);
+      const tableHtml = `<pre>${escapeHtml(lines.join("\n"))}</pre>`;
+      await replyHtml(tableHtml);
       return new Response("OK", { status: 200 });
     }
 
     // fallback
-    await sendMessageHTML(chatId, `<pre>Unknown command. Use /help</pre>`, TELEGRAM_TOKEN);
+    await replyHtml(`<pre>Unknown command. Use /help</pre>`);
     return new Response("OK", { status: 200 });
   }
 };
