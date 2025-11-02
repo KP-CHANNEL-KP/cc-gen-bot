@@ -1,14 +1,10 @@
-// worker.js
-// Telegram CC Gen Worker — SAFE TEST MODE (produces NON‑WORKING test numbers)
-// - Fills templates to 12 digits (fills x/X with random digits).
-// - Keeps expiry if provided, otherwise random.
-// - CVV generated per config (random or XXX).
-// - IMPORTANT: Generated PANs are intentionally made Luhn-invalid and tagged "INVALID-TEST".
+// worker.js (fixed fillTemplateToLength -> always produce OUTPUT_DIGITS length)
+// Telegram CC Gen Worker — SAFE TEST MODE (NON-WORKING numbers)
 // Env required: TELEGRAM_TOKEN_ENV
 
 // ----------------- Configuration -----------------
 const CVV_MODE = "random"; // "random" or "XXX"
-const OUTPUT_DIGITS = 12; // fill template to this many digits (as requested)
+const OUTPUT_DIGITS = 12; // ensure output digit count
 const USE_MASKED_PLACEHOLDERS = false; // if true, 'x' => 'X' (masked); if false, 'x' => random digit
 // ------------------------------------------------
 
@@ -21,37 +17,44 @@ function randDigit() { return String(Math.floor(Math.random() * 10)); }
 function randDigits(n) { let r=""; for(let i=0;i<n;i++) r+=randDigit(); return r; }
 function genRandomCVV() { return String(Math.floor(Math.random() * 900) + 100); }
 
-// Fill template: keep digits, treat x/X as placeholders to fill
+// ======= NEW: robust fillTemplateToLength =======
+// Keep digits from template in order; treat x/X as placeholders to fill with digits (or 'X' if masked).
+// Guarantee returned string length === length by padding with random digits if needed.
+// Non-digit characters other than x/X are ignored.
 function fillTemplateToLength(template, length) {
-  template = String(template || "").replace(/\s+/g,"");
-  // Build digits-only string by replacing non-digit, non-x with empty
-  let out = "";
-  for (const ch of template) {
-    if (/\d/.test(ch)) out += ch;
-    else if (ch === "x" || ch === "X") {
-      out += USE_MASKED_PLACEHOLDERS ? "X" : randDigit();
+  template = String(template || "");
+  let outArr = [];
+
+  // first pass: take characters from template and map digits/x to output
+  for (let i = 0; i < template.length && outArr.length < length; i++) {
+    const ch = template[i];
+    if (/\d/.test(ch)) {
+      outArr.push(ch);
+    } else if (ch === "x" || ch === "X") {
+      if (USE_MASKED_PLACEHOLDERS) outArr.push("X");
+      else outArr.push(randDigit());
+    } else {
+      // ignore any other char (spaces, dashes, pipes)
     }
-    // ignore other characters
-    if (out.length >= length) break;
   }
-  // If still short, pad with random digits
-  while (out.length < length) {
-    out += USE_MASKED_PLACEHOLDERS ? "X" : randDigit();
+
+  // second pass: if still short, try to reuse trailing x placeholders from template positions beyond length
+  // (not strictly necessary) — instead just pad with random digits or masked 'X'
+  while (outArr.length < length) {
+    outArr.push(USE_MASKED_PLACEHOLDERS ? "X" : randDigit());
   }
-  // If contains 'X' masking and USE_MASKED_PLACEHOLDERS true, keep those Xs.
-  return out.slice(0, length);
+
+  // if for some reason it's longer, slice to requested length
+  return outArr.slice(0, length).join("");
 }
 
-// Luhn calculation helper (returns checksum digit expected)
-// We will deliberately corrupt the final digit to make the number INVALID.
+// Luhn checksum helper (compute check digit for numeric string without check digit)
 function luhnChecksumDigit(numStrWithoutCheckDigit) {
-  // returns the check digit (0-9) that would make number valid
   const s = numStrWithoutCheckDigit;
   let sum = 0;
-  // iterate from right to left, position index starting at 0
   for (let i = 0; i < s.length; i++) {
     let n = Number(s[s.length - 1 - i]);
-    if (i % 2 === 0) { // double every second digit from right (since check digit not included here)
+    if (i % 2 === 0) {
       n = n * 2;
       if (n > 9) n = n - 9;
     }
@@ -61,27 +64,18 @@ function luhnChecksumDigit(numStrWithoutCheckDigit) {
   return check;
 }
 
-// Make intentionally-invalid by flipping last digit away from correct one (if last is numeric)
+// Make intentionally-invalid by changing last digit away from correct one (only if fully numeric)
 function makeIntentionallyInvalid(numStr) {
-  // If contains 'X' (masked placeholders), we won't attempt Luhn — instead append " (INVALID-TEST)"
-  if (numStr.includes("X")) return numStr;
-  // If numeric:
-  if (/^\d+$/.test(numStr)) {
-    // Compute correct check digit for (all but last digit)
-    const withoutLast = numStr.slice(0, -1);
-    const correct = luhnChecksumDigit(withoutLast);
-    // pick a digit != correct
-    let d = Number(numStr.slice(-1));
-    if (d === correct) {
-      d = (d + 1) % 10; // change to different digit
-    } else {
-      // optionally set to (correct+1) %10 to ensure mismatch
-      d = (correct + 1) % 10;
-    }
-    return withoutLast + String(d);
-  } else {
-    return numStr;
-  }
+  if (numStr.includes("X")) return numStr; // masked -> leave as-is
+  if (!/^\d+$/.test(numStr)) return numStr; // non-numeric, leave
+  if (numStr.length < 2) return numStr;
+  const withoutLast = numStr.slice(0, -1);
+  const correct = luhnChecksumDigit(withoutLast);
+  // pick a different digit
+  let newLast = (correct + 1) % 10;
+  // ensure not equal to existing last digit
+  if (Number(numStr.slice(-1)) === newLast) newLast = (newLast + 1) % 10;
+  return withoutLast + String(newLast);
 }
 
 function normalizeExpiry(m, y) {
@@ -123,7 +117,6 @@ function splitLongText(text, maxLen = 3500) {
 
 function isValidTemplate(t) {
   if (!t || typeof t !== "string") return false;
-  // allow digits and x/X and length at least 1
   const cleaned = t.replace(/[^0-9xX]/g, "");
   return cleaned.length >= 1;
 }
@@ -216,7 +209,7 @@ export default {
         rows.push({ num: invalid, expiry: `${month}/${year}`, cvv });
       }
 
-      // Build table: Card(12) | Expiry | CVV | Note
+      // Build table: Card(12) | Expiry | CVV
       const col1 = 20, col2 = 10, col3 = 6;
       const header = ["Card(12)".padEnd(col1), "Expiry".padEnd(col2), "CVV".padEnd(col3)].join(" ");
       const sep = "-".repeat(col1 + col2 + col3 + 2);
