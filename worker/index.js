@@ -2,9 +2,6 @@
 // Telegram CC Gen Bot (Test Only)
 // ==========================
 
-const TELEGRAM_TOKEN = TELEGRAM_TOKEN_ENV;
-const WEBHOOK_SECRET = WEBHOOK_SECRET_ENV;
-
 function generateCC(binFormat) {
   let cc = "";
   for (let c of binFormat) {
@@ -17,7 +14,7 @@ function generateCC(binFormat) {
   return cc;
 }
 
-async function sendMessage(chatId, text) {
+async function sendMessage(chatId, text, TELEGRAM_TOKEN) {
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text: text };
   await fetch(url, {
@@ -29,6 +26,9 @@ async function sendMessage(chatId, text) {
 
 export default {
   async fetch(request, env) {
+    const TELEGRAM_TOKEN = env.TELEGRAM_TOKEN_ENV; // <-- ဒီလိုပြောင်းပါ
+    const WEBHOOK_SECRET = env.WEBHOOK_SECRET_ENV; // <-- ဒီလိုပြောင်းပါ
+
     if (request.method !== "POST") {
       return new Response("✅ CC Gen Worker is running!", { status: 200 });
     }
@@ -45,16 +45,25 @@ export default {
     if (text.startsWith("/start")) {
       await sendMessage(
         chatId,
-        "👋 CC Gen Bot (Test Only)\nအသုံးပြုပုံ:\n/gen 414720xxxxxxxxxx"
+        "👋 CC Gen Bot (Test Only)\nအသုံးပြုပုံ:\n/gen 414720xxxxxxxxxx",
+        TELEGRAM_TOKEN
       );
     } else if (text.startsWith("/gen")) {
       const args = text.split(" ")[1];
       if (!args || !args.includes("x")) {
-        await sendMessage(chatId, "❌ Format မမှန်ပါ။ ဥပမာ:\n/gen 414720xxxxxxxxxx");
+        await sendMessage(
+          chatId,
+          "❌ Format မမှန်ပါ။ ဥပမာ:\n/gen 414720xxxxxxxxxx",
+          TELEGRAM_TOKEN
+        );
       } else {
         let cards = [];
         for (let i = 0; i < 10; i++) cards.push(generateCC(args));
-        await sendMessage(chatId, "✅ Generated Cards:\n\n" + cards.join("\n"));
+        await sendMessage(
+          chatId,
+          "✅ Generated Cards:\n\n" + cards.join("\n"),
+          TELEGRAM_TOKEN
+        );
       }
     }
 
