@@ -1,9 +1,9 @@
 // worker.js
-// CC Gen + real BIN info via binlist.net + Stripe (test) validator
-// - /gen <6-digit> -> 10 cards (table) + real BIN info fetched from binlist.net (cached 24h)
+// CC Gen + real BIN info via binlist.net (cached) + Stripe test validator
+// - /gen <6-digit> -> 10 cards (neatly formatted table) + BIN info from binlist.net (cached 24h)
 // - /gen1 <6-digit> -> single card
-// - /validate <num> <mm> <yyyy> <cvc> -> Stripe test token (optional)
-// Env vars: TELEGRAM_TOKEN_ENV, STRIPE_SECRET (optional)
+// - /validate <num> <mm> <yyyy> <cvc> -> Stripe test tokenization (optional)
+// Env vars: TELEGRAM_TOKEN_ENV (required), STRIPE_SECRET (optional for /validate)
 
 // --------------------------
 // Helpers: CC generation
@@ -30,7 +30,7 @@ function generateCVV() {
 function generateFullCCParts(shortBin) {
   const digits = (shortBin || "").replace(/\D/g, "").slice(0, 6);
   const short = digits.padEnd(6, "0");
-  const template = short + "xxxxxxxxxx"; // 16 digits
+  const template = short + "xxxxxxxxxx"; // 16 digits total
   const ccNumber = generateCC(template);
   const { month, year } = generateExpiryParts();
   const cvv = generateCVV();
@@ -38,48 +38,25 @@ function generateFullCCParts(shortBin) {
 }
 
 // --------------------------
-// Fallback simple BIN info
-// --------------------------
-function simpleBinInfo(bin6) {
-  const b = (bin6 || "").replace(/\D/g, "").slice(0, 6);
-  if (b.length < 6) return { scheme: "unknown", type: "unknown", bank: "Unknown Bank", country: "Unknown", country_emoji: "" };
-  let scheme = "UNKNOWN", type = "UNKNOWN";
-  if (b.startsWith("4")) scheme = "VISA";
-  const first2 = parseInt(b.slice(0,2), 10);
-  const first4 = parseInt(b.slice(0,4), 10);
-  if ((first2 >= 51 && first2 <= 55) || (first4 >= 2221 && first4 <= 2720)) scheme = "MASTERCARD";
-  type = "DEBIT";
-  // small mapping examples
-  let bank = "Unknown Bank", country = "Unknown", country_emoji = "";
-  if (b.startsWith("525282") || b.startsWith("484783")) {
-    bank = "AL RAJHI BANKING AND INVESTMENT CORP.";
-    country = "SAUDI ARABIA";
-    country_emoji = " 🇸🇦";
-  } else if (b.startsWith("424242")) {
-    bank = "Stripe Test Bank";
-    country = "UNITED STATES";
-    country_emoji = " 🇺🇸";
-  }
-  return { scheme, type, bank, country, country_emoji };
-}
-
-// --------------------------
 // binlist lookup with caching (caches.default)
-// - caches response JSON for 24 hours
+// - caches response JSON for 24 hours (86400s)
+// - if binlist fails or returns non-200, return null (caller will show Unknown)
 // --------------------------
 async function getBinInfo(bin6) {
   bin6 = (bin6 || "").replace(/\D/g, "").slice(0, 6);
   if (bin6.length < 6) return null;
 
-  const cacheKey = `binlist:${bin6}`;
+  const cache = caches.default;
+  const cacheKey = `https://workers.internal/binlist/${bin6}`; // unique cache key as Request URL
+  const cacheReq = new Request(cacheKey);
+
   try {
     // try cache first
-    const cache = caches.default;
-    const cached = await cache.match(cacheKey);
+    const cached = await cache.match(cacheReq);
     if (cached) {
       try {
-        const data = await cached.json();
-        return data;
+        const cachedJson = await cached.json();
+        return cachedJson;
       } catch (e) {
         // fallthrough to network fetch
       }
@@ -87,11 +64,20 @@ async function getBinInfo(bin6) {
 
     // fetch from binlist
     const url = `https://lookup.binlist.net/${bin6}`;
-    const resp = await fetch(url, { headers: { "Accept": "application/json", "User-Agent": "CF-Worker-BinLookup/1.0" } });
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        // optional User-Agent to identify your worker
+        "User-Agent": "CF-Worker-BinLookup/1.0"
+      }
+    });
+
     if (!resp.ok) {
-      // non-200 -> fallback
+      // non-200 -> treat as unavailable
       return null;
     }
+
     const j = await resp.json();
 
     // Normalize fields we care about:
@@ -99,27 +85,33 @@ async function getBinInfo(bin6) {
       scheme: j.scheme || j.brand || "unknown",
       type: j.type || "unknown",
       bank: (j.bank && (j.bank.name || j.bank)) || "Unknown Bank",
-      country: (j.country && (j.country.name || j.country)) || (j.country && j.country.alpha2) || "Unknown",
+      country: (j.country && (j.country.name || j.country)) || "Unknown",
+      country_alpha2: (j.country && j.country.alpha2) || null,
       country_emoji: (j.country && j.country.alpha2) ? countryCodeToEmoji(j.country.alpha2) : ""
     };
 
-    // cache JSON for 24h
-    const respToCache = new Response(JSON.stringify(info), { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=86400" } });
-    // caches.default expects a Request object; we'll store under cacheKey by creating Request with cacheKey
-    await cache.put(cacheKey, respToCache.clone());
+    // Cache the normalized info as JSON for 24 hours
+    const respToCache = new Response(JSON.stringify(info), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=86400"
+      }
+    });
+    await cache.put(cacheReq, respToCache.clone());
 
     return info;
   } catch (e) {
-    // network or other error -> return null to trigger fallback
+    // network or other error -> return null to indicate unavailable
     return null;
   }
 }
 
-// helper: convert country code (ISO 3166-1 alpha-2) to emoji
+// helper: convert ISO alpha-2 code to emoji flag
 function countryCodeToEmoji(code) {
   if (!code) return "";
-  const A = 0x1F1E6; // Regional Indicator Symbol Letter A
-  const chars = code.toUpperCase().split('').map(c => A + c.charCodeAt(0) - 65);
+  const A = 0x1F1E6;
+  const chars = code.toUpperCase().split("").map(c => A + c.charCodeAt(0) - 65);
   return String.fromCodePoint(...chars);
 }
 
@@ -128,7 +120,12 @@ function countryCodeToEmoji(code) {
 // --------------------------
 async function sendMessageHTML(chatId, htmlText, TELEGRAM_TOKEN) {
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-  const body = { chat_id: chatId, text: htmlText, parse_mode: "HTML", disable_web_page_preview: true };
+  const body = {
+    chat_id: chatId,
+    text: htmlText,
+    parse_mode: "HTML",
+    disable_web_page_preview: true
+  };
   await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
@@ -151,7 +148,7 @@ async function stripeTokenize(cardNumber, exp_month, exp_year, cvc, STRIPE_SECRE
   return { status: resp.status, body: json };
 }
 
-// small helper to escape HTML
+// escape for HTML interpolation
 function escapeHtml(s) {
   if (!s) return "";
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -165,7 +162,7 @@ export default {
     const TELEGRAM_TOKEN = env.TELEGRAM_TOKEN_ENV || "";
     const STRIPE_SECRET = env.STRIPE_SECRET || "";
 
-    if (!TELEGRAM_TOKEN) return new Response("Error: TELEGRAM_TOKEN_ENV not set.", { status: 500 });
+    if (!TELEGRAM_TOKEN) return new Response("Error: TELEGRAM_TOKEN_ENV not set in Worker environment.", { status: 500 });
     if (request.method !== "POST") return new Response("OK - Worker running", { status: 200 });
 
     let update;
@@ -182,13 +179,13 @@ export default {
         "👋 CC Gen Bot (Test Only)",
         "",
         "Commands:",
-        "/gen <6-digit>   — generate 10 cards (table) + BIN info below (real BIN via binlist.net)",
+        "/gen <6-digit>   — generate 10 cards (table) + BIN info from binlist.net (cached 24h)",
         "/gen1 <6-digit>  — generate 1 card (single line)",
         "/validate <num> <mm> <yyyy> <cvc> — validate via Stripe (TEST KEY ONLY)",
         "",
         "⚠️ Use only STRIPE_SECRET=test key (sk_test_...). Do NOT test real people's cards."
       ].join("\n");
-      await sendMessageHTML(chatId, `<pre>${help}</pre>`, TELEGRAM_TOKEN);
+      await sendMessageHTML(chatId, `<pre>${escapeHtml(help)}</pre>`, TELEGRAM_TOKEN);
       return new Response("OK", { status: 200 });
     }
 
@@ -203,7 +200,7 @@ export default {
       }
       const { ccNumber, month, year, cvv } = generateFullCCParts(digits);
       const line = `${ccNumber} | ${month}/20${year} | ${cvv}`;
-      await sendMessageHTML(chatId, `<pre>${line}</pre>`, TELEGRAM_TOKEN);
+      await sendMessageHTML(chatId, `<pre>${escapeHtml(line)}</pre>`, TELEGRAM_TOKEN);
       return new Response("OK", { status: 200 });
     }
 
@@ -233,21 +230,31 @@ export default {
       for (const r of rows) {
         lines.push(r.ccNumber.padEnd(col1) + " " + r.expiry.padEnd(col2) + " " + r.cvv.padEnd(col3));
       }
-      const tableBlock = `<pre>${lines.join("\n")}</pre>`;
+      const tableBlock = `<pre>${escapeHtml(lines.join("\n"))}</pre>`;
 
       // lookup BIN info from binlist.net (cached)
       const bin6 = digits.slice(0,6);
       let binInfo = await getBinInfo(bin6);
-      if (!binInfo) {
-        // fallback to simple heuristic if binlist failed
-        const fb = simpleBinInfo(bin6);
-        binInfo = { scheme: fb.scheme, type: fb.type, bank: fb.bank, country: fb.country, country_emoji: fb.country_emoji || "" };
+
+      // If binlist didn't return data, show Unknowns (no fallback mapping)
+      let bank = "Unknown Bank";
+      let country = "Unknown";
+      let country_emoji = "";
+      let scheme = "unknown";
+      let type = "unknown";
+
+      if (binInfo) {
+        bank = binInfo.bank || bank;
+        country = binInfo.country || country;
+        country_emoji = binInfo.country_emoji || "";
+        scheme = binInfo.scheme || scheme;
+        type = binInfo.type || type;
       }
 
       const infoLines = [
-        `<b>Bank:</b> ${escapeHtml(binInfo.bank)}`,
-        `<b>Country:</b> ${escapeHtml(binInfo.country)}${binInfo.country_emoji || ""}`,
-        `<b>BIN Info:</b> ${escapeHtml((binInfo.scheme || "unknown") + " - " + (binInfo.type || "unknown"))}`,
+        `<b>Bank:</b> ${escapeHtml(bank)}`,
+        `<b>Country:</b> ${escapeHtml(country)}${country_emoji}`,
+        `<b>BIN Info:</b> ${escapeHtml(`${scheme} - ${type}`)}`,
         `<b>BIN:</b> ${escapeHtml(bin6)}`
       ].join("\n");
 
@@ -286,7 +293,7 @@ export default {
             `Funding: ${card.funding || "unknown"}`,
             `Country: ${card.country || "unknown"}`
           ].join("\n");
-          await sendMessageHTML(chatId, `<pre>${out}</pre>`, TELEGRAM_TOKEN);
+          await sendMessageHTML(chatId, `<pre>${escapeHtml(out)}</pre>`, TELEGRAM_TOKEN);
         } else {
           const errMsg = (res.body && res.body.error && res.body.error.message) ? res.body.error.message : JSON.stringify(res.body);
           await sendMessageHTML(chatId, `<pre>❌ Stripe error: ${escapeHtml(errMsg)}</pre>`, TELEGRAM_TOKEN);
