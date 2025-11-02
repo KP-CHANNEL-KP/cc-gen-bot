@@ -1,152 +1,63 @@
-// worker/index.js
+// ==========================
+// Telegram CC Gen Bot (Test Only)
+// ==========================
 
-const TELEGRAM_SEND_URL = (token) => `https://api.telegram.org/bot${token}/sendMessage`;
+const TELEGRAM_TOKEN = TELEGRAM_TOKEN_ENV;
+const WEBHOOK_SECRET = WEBHOOK_SECRET_ENV;
 
-// Utility: Luhn
-function luhnValid(num) {
-  const s = num.replace(/\D/g, '');
-  if (!s) return false;
-  let sum = 0;
-  let double = false;
-  for (let i = s.length - 1; i >= 0; i--) {
-    let d = parseInt(s[i], 10);
-    if (double) {
-      d *= 2;
-      if (d > 9) d -= 9;
+function generateCC(binFormat) {
+  let cc = "";
+  for (let c of binFormat) {
+    if (c === "x") {
+      cc += Math.floor(Math.random() * 10);
+    } else {
+      cc += c;
     }
-    sum += d;
-    double = !double;
   }
-  return sum % 10 === 0;
+  return cc;
 }
 
-function genFromFormat(fmt) {
-  let out = '';
-  for (const ch of fmt) {
-    if ('xX#?'.includes(ch)) out += String(Math.floor(Math.random() * 10));
-    else out += ch;
-  }
-  return out;
-}
-
-function simpleBinInfo(bin) {
-  bin = bin.replace(/\D/g, '').slice(0, 8);
-  if (bin.length < 6) return { error: 'BIN must be >= 6 digits' };
-  const res = { bin };
-  if (bin.startsWith('4')) res.scheme = 'visa';
-  else {
-    const first2 = parseInt(bin.slice(0,2),10);
-    const first4 = parseInt(bin.slice(0,4),10);
-    if ((first2 >= 51 && first2 <= 55) || (first4 >= 2221 && first4 <= 2720)) res.scheme = 'mastercard';
-    else res.scheme = 'unknown';
-  }
-  return res;
-}
-
-async function replyText(token, chat_id, text, parse_mode='Markdown') {
-  const url = TELEGRAM_SEND_URL(token);
+async function sendMessage(chatId, text) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  const body = { chat_id: chatId, text: text };
   await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id, text, parse_mode })
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
-
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  // For extra safety, expect webhook path like /telegram/<SECRET>
-  // The secret is part of the Worker route; we still read it from path but validate optionally.
-  if (request.method !== 'POST') return new Response('OK', { status: 200 });
-
-  let body;
-  try {
-    body = await request.json();
-  } catch (e) {
-    return new Response('bad json', { status: 400 });
-  }
-
-  const TELEGRAM_TOKEN = TELEGRAM_TOKEN_ENV; // replaced by wrangler env var during deploy
-  if (!TELEGRAM_TOKEN) return new Response('No token', { status: 500 });
-
-  // Basic safety: ensure it's a Telegram update
-  const update = body;
-  const message = update.message || update.edited_message || update.callback_query && update.callback_query.message;
-  if (!message || !message.text) return new Response('no message', { status: 200 });
-
-  const text = message.text.trim();
-  const chat_id = message.chat.id;
-  const from_id = message.from && message.from.id;
-
-  // commands
-  const parts = text.split(/\s+/);
-  const cmd = parts[0].toLowerCase();
-
-  try {
-    if (cmd === '/start' || cmd === '/help') {
-      const help = `👋 *CC Gen & BIN Checker (Worker)*\n\nCommands:\n/gen <format>\n/gen10 <format>\n/luhn <number>\n/bininfo <bin>\n/check <number>\n\n_Testing only._`;
-      await replyText(TELEGRAM_TOKEN, chat_id, help);
-      return new Response('ok', { status: 200 });
+export default {
+  async fetch(request, env) {
+    if (request.method !== "POST") {
+      return new Response("✅ CC Gen Worker is running!", { status: 200 });
     }
 
-    if (cmd === '/gen' || cmd === '/gen10') {
-      if (parts.length < 2) {
-        await replyText(TELEGRAM_TOKEN, chat_id, "Usage: /gen 414720xxxxxxxxxx");
-        return new Response('ok', { status: 200 });
-      }
-      const fmt = parts.slice(1).join(' ');
-      const count = cmd === '/gen' ? 1 : 10;
-      const out = [];
-      for (let i=0;i<count;i++) {
-        const card = genFromFormat(fmt);
-        const ok = luhnValid(card) ? '✅ Luhn OK' : '❌ Luhn FAIL';
-        out.push(`${card} — ${ok}`);
-      }
-      await replyText(TELEGRAM_TOKEN, chat_id, '```\n' + out.join('\n') + '\n```');
-      return new Response('ok', { status: 200 });
+    const update = await request.json();
+    const message = update.message;
+    if (!message || !message.text) {
+      return new Response("No message", { status: 200 });
     }
 
-    if (cmd === '/luhn') {
-      if (parts.length < 2) {
-        await replyText(TELEGRAM_TOKEN, chat_id, "Usage: /luhn 4242424242424242");
-        return new Response('ok', { status: 200 });
+    const text = message.text.trim();
+    const chatId = message.chat.id;
+
+    if (text.startsWith("/start")) {
+      await sendMessage(
+        chatId,
+        "👋 CC Gen Bot (Test Only)\nအသုံးပြုပုံ:\n/gen 414720xxxxxxxxxx"
+      );
+    } else if (text.startsWith("/gen")) {
+      const args = text.split(" ")[1];
+      if (!args || !args.includes("x")) {
+        await sendMessage(chatId, "❌ Format မမှန်ပါ။ ဥပမာ:\n/gen 414720xxxxxxxxxx");
+      } else {
+        let cards = [];
+        for (let i = 0; i < 10; i++) cards.push(generateCC(args));
+        await sendMessage(chatId, "✅ Generated Cards:\n\n" + cards.join("\n"));
       }
-      const num = parts[1].replace(/\D/g,'');
-      const ok = luhnValid(num);
-      await replyText(TELEGRAM_TOKEN, chat_id, `Luhn valid: ${ok ? 'Yes ✅' : 'No ❌'}`);
-      return new Response('ok', { status: 200 });
     }
 
-    if (cmd === '/bininfo') {
-      if (parts.length < 2) {
-        await replyText(TELEGRAM_TOKEN, chat_id, "Usage: /bininfo 414720");
-        return new Response('ok', { status: 200 });
-      }
-      const info = simpleBinInfo(parts[1]);
-      await replyText(TELEGRAM_TOKEN, chat_id, '```\n' + JSON.stringify(info, null, 2) + '\n```');
-      return new Response('ok', { status: 200 });
-    }
-
-    if (cmd === '/check') {
-      if (parts.length < 2) {
-        await replyText(TELEGRAM_TOKEN, chat_id, "Usage: /check 4242424242424242");
-        return new Response('ok', { status: 200 });
-      }
-      const num = parts[1].replace(/\D/g,'');
-      const luhn_ok = luhnValid(num);
-      await replyText(TELEGRAM_TOKEN, chat_id, `Length: ${num.length}\nLuhn: ${luhn_ok ? 'OK' : 'FAIL'}`);
-      return new Response('ok', { status: 200 });
-    }
-
-    // fallback
-    await replyText(TELEGRAM_TOKEN, chat_id, "Unknown command. Use /help");
-    return new Response('ok', { status: 200 });
-  } catch (err) {
-    // Optionally log to console (visible in Cloudflare Worker logs)
-    console.error(err);
-    return new Response('error', { status: 500 });
-  }
-}
+    return new Response("OK", { status: 200 });
+  },
+};
